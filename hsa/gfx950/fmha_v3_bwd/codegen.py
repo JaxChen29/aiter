@@ -503,6 +503,7 @@ class fmha_bwd_v3_kernel
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }
 
+    // fuse fmha_bwd_v3_args and fmha_bwd_v3_args_group/fmha_bwd_v3_swa_genl_args logic
     void
     launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_v3_args args, const ck_tile::stream_config& s) const
     {
