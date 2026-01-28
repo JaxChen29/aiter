@@ -6,13 +6,141 @@
 
 #include <array>
 #include <cstring>
+#include <fstream>
 #include <functional>
+#include <iomanip>
 #include <numeric>
 #include <ostream>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
+
+// Dump tensor to hex file in format:
+// ++++Batch[XXXX]---head[XXXX]++++:
+// R[XXXX]: 0xYYYY 0xYYYY 0xYYYY ...
+template <typename DataType>
+void dump_tensor_to_hex(const ck_tile::HostTensor<DataType>& tensor,
+                        const std::string& filename,
+                        ck_tile::index_t batch,
+                        ck_tile::index_t nhead,
+                        ck_tile::index_t seqlen,
+                        ck_tile::index_t hdim,
+                        bool i_perm)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Error: Cannot open file " << filename << " for writing" << std::endl;
+        return;
+    }
+
+    for(ck_tile::index_t b = 0; b < batch; ++b)
+    {
+        for(ck_tile::index_t h = 0; h < nhead; ++h)
+        {
+            // Batch/head in decimal with zero-fill
+            file << std::dec << std::setfill('0');
+            file << "++++Batch[" << std::setw(4) << b << "]---head[" << std::setw(4) << h
+                 << "]++++: " << std::endl;
+
+            for(ck_tile::index_t s = 0; s < seqlen; ++s)
+            {
+                // Row number in decimal with zero-fill
+                file << std::dec << std::setfill('0');
+                file << "R[" << std::setw(4) << s << "]:";
+
+                for(ck_tile::index_t d = 0; d < hdim; ++d)
+                {
+                    DataType val;
+                    if(i_perm)
+                    {
+                        val = tensor(b, h, s, d); // bhsd layout
+                    }
+                    else
+                    {
+                        val = tensor(b, s, h, d); // bshd layout
+                    }
+
+                    // Get the raw bits of the value and output in hex
+                    uint16_t raw_bits;
+                    std::memcpy(&raw_bits, &val, sizeof(uint16_t));
+
+                    file << std::hex << std::setfill('0');
+                    file << " 0x" << std::setw(4) << raw_bits;
+                }
+                file << " " << std::endl;
+            }
+        }
+    }
+
+    file.close();
+    std::cout << "Dumped tensor to " << filename << std::endl;
+}
+
+// Dump 3D tensor (nhead, seqlen, hdim) to hex file for a single batch
+// Used for CPU reference tensors and per-batch GPU results
+template <typename DataType>
+void dump_tensor_3d_to_hex(const ck_tile::HostTensor<DataType>& tensor,
+                           const std::string& filename,
+                           ck_tile::index_t batch_idx,
+                           bool append = false)
+{
+    std::ofstream file;
+    if(append)
+    {
+        file.open(filename, std::ios::app);
+    }
+    else
+    {
+        file.open(filename);
+    }
+
+    if(!file.is_open())
+    {
+        std::cerr << "Error: Cannot open file " << filename << " for writing" << std::endl;
+        return;
+    }
+
+    // tensor shape is {nhead, seqlen, hdim}
+    const ck_tile::index_t nhead  = tensor.mDesc.get_lengths()[0];
+    const ck_tile::index_t seqlen = tensor.mDesc.get_lengths()[1];
+    const ck_tile::index_t hdim   = tensor.mDesc.get_lengths()[2];
+
+    for(ck_tile::index_t h = 0; h < nhead; ++h)
+    {
+        // Batch/head in decimal with zero-fill
+        file << std::dec << std::setfill('0');
+        file << "++++Batch[" << std::setw(4) << batch_idx << "]---head[" << std::setw(4) << h
+             << "]++++: " << std::endl;
+
+        for(ck_tile::index_t s = 0; s < seqlen; ++s)
+        {
+            // Row number in decimal with zero-fill
+            file << std::dec << std::setfill('0');
+            file << "R[" << std::setw(4) << s << "]:";
+
+            for(ck_tile::index_t d = 0; d < hdim; ++d)
+            {
+                DataType val = tensor(h, s, d);
+
+                // Get the raw bits of the value and output in hex
+                uint16_t raw_bits;
+                std::memcpy(&raw_bits, &val, sizeof(uint16_t));
+
+                file << std::hex << std::setfill('0');
+                file << " 0x" << std::setw(4) << raw_bits;
+            }
+            file << " " << std::endl;
+        }
+    }
+
+    file.close();
+    if(!append)
+    {
+        std::cout << "Dumped tensor to " << filename << std::endl;
+    }
+}
 
 // This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
 std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
@@ -158,7 +286,10 @@ auto create_args(int argc, char* argv[])
                 "float to bf16 convert type when bwd_v3 is set to 1, 0:RTNE; 1:RTNA; 2:RTZ")
         .insert("v3_api_check",
                 "0",
-                "if set to 1, check whether the input scenario is supported by the asm kernel.");
+                "if set to 1, check whether the input scenario is supported by the asm kernel.")
+        .insert("dump",
+                "",
+                "dump dQ/dK/dV to hex files. provide prefix, e.g. 'output' will create output_dq.hex, output_dk.hex, output_dv.hex");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -936,6 +1067,19 @@ bool run(const ck_tile::ArgParser& arg_parser)
     dv_buf.FromDevice(dv_host.data());
     dbias_buf.FromDevice(dbias_host.data());
 
+    // Dump dQ/dK/dV to hex files if requested
+    // When validation is OFF: dump GPU results only (from full 4D tensor)
+    // When validation is ON: dump both CPU and GPU results (per-batch inside validation loop)
+    std::string dump_prefix = arg_parser.get_str("dump");
+    if(!dump_prefix.empty() && !do_validation)
+    {
+        // GPU-only dump when validation is disabled
+        dump_tensor_to_hex(dq_host, dump_prefix + "_gpu_dq.hex", shape_batch, nhead, shape_seqlen_q, hdim_q, i_perm);
+        dump_tensor_to_hex(dk_host, dump_prefix + "_gpu_dk.hex", shape_batch, nhead_k, shape_seqlen_k, hdim_q, i_perm);
+        dump_tensor_to_hex(dv_host, dump_prefix + "_gpu_dv.hex", shape_batch, nhead_k, shape_seqlen_k, hdim_v, i_perm);
+        std::cout << "Note: Enable validation (-v 1) to also dump CPU reference tensors" << std::endl;
+    }
+
     for(ck_tile::index_t wb = 0; wb < batch; ++wb)
     {
         const ck_tile::index_t real_seqlen_q = seqstart_q_host[wb + 1] - seqstart_q_host[wb];
@@ -1062,6 +1206,23 @@ bool run(const ck_tile::ArgParser& arg_parser)
             else       dbias_host_result.ForEach([&](auto& self, auto idx) {self(idx) = dbias_host(b, idx[1] + query_offset, idx[0], idx[2]); });
         }
         // clang-format on
+
+        // Dump CPU and GPU dQ/dK/dV per batch if requested
+        if(!dump_prefix.empty())
+        {
+            bool append = (wb > 0); // append for subsequent batches
+            dump_tensor_3d_to_hex(dq_host_ref, dump_prefix + "_cpu_dq.hex", wb, append);
+            dump_tensor_3d_to_hex(dk_host_ref, dump_prefix + "_cpu_dk.hex", wb, append);
+            dump_tensor_3d_to_hex(dv_host_ref, dump_prefix + "_cpu_dv.hex", wb, append);
+            dump_tensor_3d_to_hex(dq_host_result, dump_prefix + "_gpu_dq.hex", wb, append);
+            dump_tensor_3d_to_hex(dk_host_result, dump_prefix + "_gpu_dk.hex", wb, append);
+            dump_tensor_3d_to_hex(dv_host_result, dump_prefix + "_gpu_dv.hex", wb, append);
+            if(wb == batch - 1)
+            {
+                std::cout << "Dumped CPU tensors to " << dump_prefix << "_cpu_d{q,k,v}.hex" << std::endl;
+                std::cout << "Dumped GPU tensors to " << dump_prefix << "_gpu_d{q,k,v}.hex" << std::endl;
+            }
+        }
 
         auto [rtol, atol] = get_elimit<DataTypeConfig>(hdim_q, hdim_v);
         bool dq_cur_pass  = ck_tile::check_err(dq_host_result,
