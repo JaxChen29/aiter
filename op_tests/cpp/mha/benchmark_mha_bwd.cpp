@@ -130,7 +130,7 @@ auto create_args(int argc, char* argv[])
                 "'g:y,x', generic attention mask coordinate with y/x size (only debug purpose for "
                 "now)")
         .insert("kname", "0", "if set to 1 will print kernel name")
-        .insert("init", "1", "init method. 0:random int, 1:random float, 2:trig float")
+        .insert("init", "1", "init method. 0:random int, 1:random float, 2:trig float, 3:all ones")
         .insert("seed",
                 "11939",
                 "random seed used for initializing input tensors. 0 for "
@@ -425,6 +425,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
         ck_tile::FillTrigValue<VDataType>{}(v_host);
         ck_tile::FillTrigValue<BiasDataType>{}(bias_host);
         ck_tile::FillTrigValue<OGradDataType>{}(do_host);
+    }
+    else if(init_method == 3)
+    {
+        // All ones initialization for debugging
+        ck_tile::FillConstant<QDataType>{1.0f}(q_host);
+        ck_tile::FillConstant<KDataType>{1.0f}(k_host);
+        ck_tile::FillConstant<VDataType>{1.0f}(v_host);
+        ck_tile::FillConstant<BiasDataType>{0.0f}(bias_host); // No bias for simple debug
+        ck_tile::FillConstant<OGradDataType>{1.0f}(do_host);
     }
     if(bias.type == bias_enum::alibi)
     {
