@@ -142,6 +142,126 @@ void dump_tensor_3d_to_hex(const ck_tile::HostTensor<DataType>& tensor,
     }
 }
 
+// Dump 2D LSE tensor (nhead, seqlen) to hex file for a single batch
+// LSE values are float32, so we output 32-bit hex values
+template <typename DataType>
+void dump_lse_2d_to_hex(const ck_tile::HostTensor<DataType>& tensor,
+                        const std::string& filename,
+                        ck_tile::index_t batch_idx,
+                        bool append = false)
+{
+    std::ofstream file;
+    if(append)
+    {
+        file.open(filename, std::ios::app);
+    }
+    else
+    {
+        file.open(filename);
+    }
+
+    if(!file.is_open())
+    {
+        std::cerr << "Error: Cannot open file " << filename << " for writing" << std::endl;
+        return;
+    }
+
+    // tensor shape is {nhead, seqlen}
+    const ck_tile::index_t nhead  = tensor.mDesc.get_lengths()[0];
+    const ck_tile::index_t seqlen = tensor.mDesc.get_lengths()[1];
+
+    for(ck_tile::index_t h = 0; h < nhead; ++h)
+    {
+        // Batch/head in decimal with zero-fill
+        file << std::dec << std::setfill('0');
+        file << "++++Batch[" << std::setw(4) << batch_idx << "]---head[" << std::setw(4) << h
+             << "]++++: " << std::endl;
+
+        // Output all LSE values in a single row per head, or one value per row
+        for(ck_tile::index_t s = 0; s < seqlen; ++s)
+        {
+            // Row number in decimal with zero-fill
+            file << std::dec << std::setfill('0');
+            file << "R[" << std::setw(4) << s << "]:";
+
+            DataType val = tensor(h, s);
+
+            // Get the raw bits of the value and output in hex
+            // LSE is typically float32
+            uint32_t raw_bits;
+            std::memcpy(&raw_bits, &val, sizeof(uint32_t));
+
+            file << std::hex << std::setfill('0');
+            file << " 0x" << std::setw(8) << raw_bits;
+
+            // Also output the float value for easier debugging
+            file << std::dec << std::setfill(' ');
+            file << " (" << std::setw(12) << val << ")";
+            file << std::endl;
+        }
+    }
+
+    file.close();
+    if(!append)
+    {
+        std::cout << "Dumped LSE tensor to " << filename << std::endl;
+    }
+}
+
+// Dump 3D LSE tensor (batch, nhead, seqlen) to hex file
+template <typename DataType>
+void dump_lse_3d_to_hex(const ck_tile::HostTensor<DataType>& tensor,
+                        const std::string& filename)
+{
+    std::ofstream file(filename);
+
+    if(!file.is_open())
+    {
+        std::cerr << "Error: Cannot open file " << filename << " for writing" << std::endl;
+        return;
+    }
+
+    // tensor shape is {batch, nhead, seqlen}
+    const ck_tile::index_t batch  = tensor.mDesc.get_lengths()[0];
+    const ck_tile::index_t nhead  = tensor.mDesc.get_lengths()[1];
+    const ck_tile::index_t seqlen = tensor.mDesc.get_lengths()[2];
+
+    for(ck_tile::index_t b = 0; b < batch; ++b)
+    {
+        for(ck_tile::index_t h = 0; h < nhead; ++h)
+        {
+            // Batch/head in decimal with zero-fill
+            file << std::dec << std::setfill('0');
+            file << "++++Batch[" << std::setw(4) << b << "]---head[" << std::setw(4) << h
+                 << "]++++: " << std::endl;
+
+            for(ck_tile::index_t s = 0; s < seqlen; ++s)
+            {
+                // Row number in decimal with zero-fill
+                file << std::dec << std::setfill('0');
+                file << "R[" << std::setw(4) << s << "]:";
+
+                DataType val = tensor(b, h, s);
+
+                // Get the raw bits of the value and output in hex
+                uint32_t raw_bits;
+                std::memcpy(&raw_bits, &val, sizeof(uint32_t));
+
+                file << std::hex << std::setfill('0');
+                file << " 0x" << std::setw(8) << raw_bits;
+
+                // Also output the float value for easier debugging
+                file << std::dec << std::setfill(' ');
+                file << " (" << std::setw(12) << val << ")";
+                file << std::endl;
+            }
+        }
+    }
+
+    file.close();
+    std::cout << "Dumped LSE tensor to " << filename << std::endl;
+}
+
 // This function is copied from ck commit 4d041837ade7ae01900a0442d939f80b723b1631
 std::vector<int32_t> to_seqstarts_(ck_tile::span<const int32_t> seqlens)
 {
@@ -850,6 +970,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     std::vector<ck_tile::HostTensor<KDataType>> k_host_refs;
     std::vector<ck_tile::HostTensor<VDataType>> v_host_refs;
     std::vector<ck_tile::HostTensor<ODataType>> o_host_refs;
+    std::vector<ck_tile::HostTensor<LSEDataType>> lse_host_refs;
     std::vector<ck_tile::HostTensor<RandValOutputDataType>> randval_host_refs;
     std::vector<ck_tile::HostTensor<AccDataType>> p_hp_host_refs;
     std::vector<ck_tile::HostTensor<GemmDataType>> p_lp_host_refs;
@@ -1044,6 +1165,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         k_host_refs.push_back(k_host_ref);
         v_host_refs.push_back(v_host_ref);
         o_host_refs.push_back(o_host_ref);
+        lse_host_refs.push_back(lse_host_ref);
         p_hp_host_refs.push_back(p_hp_host_ref);
         p_lp_host_refs.push_back(p_lp_host_ref);
         if(p_drop > 0)
@@ -1077,6 +1199,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         dump_tensor_to_hex(dq_host, dump_prefix + "_gpu_dq.hex", shape_batch, nhead, shape_seqlen_q, hdim_q, i_perm);
         dump_tensor_to_hex(dk_host, dump_prefix + "_gpu_dk.hex", shape_batch, nhead_k, shape_seqlen_k, hdim_q, i_perm);
         dump_tensor_to_hex(dv_host, dump_prefix + "_gpu_dv.hex", shape_batch, nhead_k, shape_seqlen_k, hdim_v, i_perm);
+        dump_lse_3d_to_hex(lse_host, dump_prefix + "_lse.hex");
         std::cout << "Note: Enable validation (-v 1) to also dump CPU reference tensors" << std::endl;
     }
 
@@ -1217,10 +1340,13 @@ bool run(const ck_tile::ArgParser& arg_parser)
             dump_tensor_3d_to_hex(dq_host_result, dump_prefix + "_gpu_dq.hex", wb, append);
             dump_tensor_3d_to_hex(dk_host_result, dump_prefix + "_gpu_dk.hex", wb, append);
             dump_tensor_3d_to_hex(dv_host_result, dump_prefix + "_gpu_dv.hex", wb, append);
+            // Dump LSE (computed on CPU for backward pass input)
+            dump_lse_2d_to_hex(lse_host_refs[wb], dump_prefix + "_lse.hex", wb, append);
             if(wb == batch - 1)
             {
                 std::cout << "Dumped CPU tensors to " << dump_prefix << "_cpu_d{q,k,v}.hex" << std::endl;
                 std::cout << "Dumped GPU tensors to " << dump_prefix << "_gpu_d{q,k,v}.hex" << std::endl;
+                std::cout << "Dumped LSE tensor to " << dump_prefix << "_lse.hex" << std::endl;
             }
         }
 
