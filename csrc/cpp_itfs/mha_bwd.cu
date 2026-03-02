@@ -3,29 +3,274 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <memory>
 #include <string>
+#include <cstdlib>
+
+namespace {
+
+static bool env_is_set(const char* name)
+{
+    const char* v = std::getenv(name);
+    return v && std::string(v) == "1";
+}
+
+__device__ __forceinline__ float bf16_to_f32(uint16_t v)
+{
+    union { uint32_t u; float f; } t;
+    t.u = uint32_t(v) << 16;
+    return t.f;
+}
+
+__device__ __forceinline__ uint16_t f32_to_bf16_rtz(float v)
+{
+    union { float f; uint32_t u; } t;
+    t.f = v;
+    return uint16_t(t.u >> 16);
+}
+
+__device__ __forceinline__ float fp16_to_f32(uint16_t v)
+{
+    _Float16 h;
+    __builtin_memcpy(&h, &v, 2);
+    return static_cast<float>(h);
+}
+
+__device__ __forceinline__ uint16_t f32_to_fp16(float v)
+{
+    _Float16 h = static_cast<_Float16>(v);
+    uint16_t r;
+    __builtin_memcpy(&r, &h, 2);
+    return r;
+}
+
+// D[b][h][s] = sum_d( O[b][h][s][d] * dO[b][h][s][d] )
+__global__ void fallback_odo_kernel(
+    const uint16_t* __restrict__ ptr_o,
+    const uint16_t* __restrict__ ptr_do,
+    float* __restrict__ ptr_d,
+    int seqlen_q,
+    int head_dim,
+    int stride_o,
+    int nhead_stride_o,
+    int batch_stride_o,
+    int stride_do,
+    int nhead_stride_do,
+    int batch_stride_do,
+    int nhead_stride_d,
+    int batch_stride_d,
+    int is_bf16,
+    const int32_t* __restrict__ cu_seqlens_q)
+{
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    if(s >= seqlen_q)
+        return;
+
+    int64_t off_o, off_do, off_d;
+    if(cu_seqlens_q) {
+        int64_t sq = cu_seqlens_q[b];
+        off_o  = sq * stride_o;
+        off_do = sq * stride_do;
+        off_d  = sq;
+    } else {
+        off_o  = (int64_t)b * batch_stride_o;
+        off_do = (int64_t)b * batch_stride_do;
+        off_d  = (int64_t)b * batch_stride_d;
+    }
+
+    const uint16_t* o  = ptr_o  + off_o  + (int64_t)h * nhead_stride_o  + (int64_t)s * stride_o;
+    const uint16_t* d_o = ptr_do + off_do + (int64_t)h * nhead_stride_do + (int64_t)s * stride_do;
+
+    float sum = 0.0f;
+    for(int d = 0; d < head_dim; d++)
+    {
+        float ov  = is_bf16 ? bf16_to_f32(o[d])  : fp16_to_f32(o[d]);
+        float dov = is_bf16 ? bf16_to_f32(d_o[d]) : fp16_to_f32(d_o[d]);
+        sum += ov * dov;
+    }
+    ptr_d[off_d + (int64_t)h * nhead_stride_d + s] = sum;
+}
+
+// dQ[b][h][s][d] = convert( dQ_acc[b][h][s][d] )
+__global__ void fallback_dq_convert_kernel(
+    const float* __restrict__ dq_acc,
+    uint16_t* __restrict__ dq,
+    int seqlen_q,
+    int head_dim,
+    int stride_dq_acc,
+    int64_t nhead_stride_dq_acc,
+    int64_t batch_stride_dq_acc,
+    int stride_dq,
+    int nhead_stride_dq,
+    int batch_stride_dq,
+    int is_bf16,
+    const int32_t* __restrict__ cu_seqlens_q)
+{
+    int d = threadIdx.x;
+    int s = blockIdx.x;
+    int h = blockIdx.y;
+    int b = blockIdx.z;
+    if(d >= head_dim || s >= seqlen_q)
+        return;
+
+    int64_t off_acc, off_dq;
+    if(cu_seqlens_q) {
+        int64_t sq = cu_seqlens_q[b];
+        off_acc = sq * stride_dq_acc;
+        off_dq  = sq * stride_dq;
+    } else {
+        off_acc = (int64_t)b * batch_stride_dq_acc;
+        off_dq  = (int64_t)b * batch_stride_dq;
+    }
+
+    float val = dq_acc[off_acc + (int64_t)h * nhead_stride_dq_acc + (int64_t)s * stride_dq_acc + d];
+    uint16_t out = is_bf16 ? f32_to_bf16_rtz(val) : f32_to_fp16(val);
+    dq[off_dq + (int64_t)h * nhead_stride_dq + (int64_t)s * stride_dq + d] = out;
+}
+
+int get_ck_hdim(int hdim)
+{
+    if(hdim <= 32) return 32;
+    if(hdim <= 64) return 64;
+    if(hdim <= 128) return 128;
+    return 256;
+}
+
+fmha_bwd_args to_ck_args(const aiter::mha_bwd_args& a)
+{
+    return fmha_bwd_args{
+        a.q_ptr, a.k_ptr, a.v_ptr, a.bias_ptr, a.o_ptr, a.lse_ptr, a.do_ptr,
+        a.d_ptr, a.rand_val_ptr, a.dq_ptr, a.dk_ptr, a.dv_ptr, a.dbias_ptr, a.dq_acc_ptr,
+        a.seqstart_q_ptr, a.seqstart_k_ptr, a.seqlen_q_ptr, a.seqlen_k_ptr,
+        a.cu_seqlen_q_ptr, a.cu_seqlen_k_ptr,
+        a.seqlen_q, a.seqlen_k, a.batch, a.max_seqlen_q, a.max_seqlen_k,
+        a.hdim_q, a.hdim_v, a.nhead_q, a.nhead_k, a.scale,
+        a.stride_q, a.stride_k, a.stride_v, a.stride_bias,
+        a.stride_o, a.stride_randval, a.stride_do, a.stride_dq_acc,
+        a.stride_dq, a.stride_dk, a.stride_dv, a.stride_dbias,
+        a.nhead_stride_q, a.nhead_stride_k, a.nhead_stride_v, a.nhead_stride_bias,
+        a.nhead_stride_o, a.nhead_stride_randval, a.nhead_stride_do, a.nhead_stride_lsed,
+        a.nhead_stride_dq_acc, a.nhead_stride_dq, a.nhead_stride_dk, a.nhead_stride_dv,
+        a.nhead_stride_dbias,
+        a.batch_stride_q, a.batch_stride_k, a.batch_stride_v, a.batch_stride_bias,
+        a.batch_stride_o, a.batch_stride_randval, a.batch_stride_do, a.batch_stride_lsed,
+        a.batch_stride_dq_acc, a.batch_stride_dq, a.batch_stride_dk, a.batch_stride_dv,
+        a.batch_stride_dbias,
+        a.split_stride_dq_acc, a.window_size_left, a.window_size_right,
+        a.ck_mask_type, a.p_drop, a.p_undrop, a.drop_seed_offset,
+    };
+}
+
+#define DISPATCH_CK_ODO(HDIM, DTYPE, GROUP) \
+    fmha_bwd_dot_do_o_oneshot_<fmha_bwd_dot_do_o_traits_<HDIM, DTYPE, GROUP, true, true>>(s, ck_a)
+
+void launch_ck_odo(const aiter::mha_bwd_args& a, const ck_tile::stream_config& s)
+{
+    fmha_bwd_args ck_a = to_ck_args(a);
+    int hdim = get_ck_hdim(a.hdim_v);
+    if(a.data_type == "bf16") {
+        if(a.is_group_mode) {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_ODO(32,  FmhaBwdBf16, true); break;
+                case 64:  DISPATCH_CK_ODO(64,  FmhaBwdBf16, true); break;
+                case 128: DISPATCH_CK_ODO(128, FmhaBwdBf16, true); break;
+                default:  DISPATCH_CK_ODO(256, FmhaBwdBf16, true); break;
+            }
+        } else {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_ODO(32,  FmhaBwdBf16, false); break;
+                case 64:  DISPATCH_CK_ODO(64,  FmhaBwdBf16, false); break;
+                case 128: DISPATCH_CK_ODO(128, FmhaBwdBf16, false); break;
+                default:  DISPATCH_CK_ODO(256, FmhaBwdBf16, false); break;
+            }
+        }
+    } else {
+        if(a.is_group_mode) {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_ODO(32,  FmhaBwdFp16, true); break;
+                case 64:  DISPATCH_CK_ODO(64,  FmhaBwdFp16, true); break;
+                case 128: DISPATCH_CK_ODO(128, FmhaBwdFp16, true); break;
+                default:  DISPATCH_CK_ODO(256, FmhaBwdFp16, true); break;
+            }
+        } else {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_ODO(32,  FmhaBwdFp16, false); break;
+                case 64:  DISPATCH_CK_ODO(64,  FmhaBwdFp16, false); break;
+                case 128: DISPATCH_CK_ODO(128, FmhaBwdFp16, false); break;
+                default:  DISPATCH_CK_ODO(256, FmhaBwdFp16, false); break;
+            }
+        }
+    }
+}
+
+#undef DISPATCH_CK_ODO
+
+#define DISPATCH_CK_DQ_CONVERT(HDIM, DTYPE, GROUP) \
+    fmha_bwd_convert_dq_oneshot_<fmha_bwd_convert_dq_traits_<HDIM, DTYPE, GROUP, true, true, false, 0>>(s, ck_a)
+
+void launch_ck_dq_convert(const aiter::mha_bwd_args& a, const ck_tile::stream_config& s)
+{
+    fmha_bwd_args ck_a = to_ck_args(a);
+    int hdim = get_ck_hdim(a.hdim_q);
+    if(a.data_type == "bf16") {
+        if(a.is_group_mode) {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_DQ_CONVERT(32,  FmhaBwdBf16, true); break;
+                case 64:  DISPATCH_CK_DQ_CONVERT(64,  FmhaBwdBf16, true); break;
+                case 128: DISPATCH_CK_DQ_CONVERT(128, FmhaBwdBf16, true); break;
+                default:  DISPATCH_CK_DQ_CONVERT(256, FmhaBwdBf16, true); break;
+            }
+        } else {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_DQ_CONVERT(32,  FmhaBwdBf16, false); break;
+                case 64:  DISPATCH_CK_DQ_CONVERT(64,  FmhaBwdBf16, false); break;
+                case 128: DISPATCH_CK_DQ_CONVERT(128, FmhaBwdBf16, false); break;
+                default:  DISPATCH_CK_DQ_CONVERT(256, FmhaBwdBf16, false); break;
+            }
+        }
+    } else {
+        if(a.is_group_mode) {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_DQ_CONVERT(32,  FmhaBwdFp16, true); break;
+                case 64:  DISPATCH_CK_DQ_CONVERT(64,  FmhaBwdFp16, true); break;
+                case 128: DISPATCH_CK_DQ_CONVERT(128, FmhaBwdFp16, true); break;
+                default:  DISPATCH_CK_DQ_CONVERT(256, FmhaBwdFp16, true); break;
+            }
+        } else {
+            switch(hdim) {
+                case 32:  DISPATCH_CK_DQ_CONVERT(32,  FmhaBwdFp16, false); break;
+                case 64:  DISPATCH_CK_DQ_CONVERT(64,  FmhaBwdFp16, false); break;
+                case 128: DISPATCH_CK_DQ_CONVERT(128, FmhaBwdFp16, false); break;
+                default:  DISPATCH_CK_DQ_CONVERT(256, FmhaBwdFp16, false); break;
+            }
+        }
+    }
+}
+
+#undef DISPATCH_CK_DQ_CONVERT
+
+} // anonymous namespace
 
 namespace aiter {
 std::tuple<int, int> get_padded_hdim(int hdim_q, int hdim_v, std::string arch_id)
 {
     if(hdim_q == 192 && hdim_v == 128 && arch_id == "gfx950")
         return std::make_tuple(hdim_q, hdim_v);
-        
-    if(hdim_q == hdim_v)
+    assert(hdim_q == hdim_v);
+    if(hdim_q <= 64)
     {
-        if(hdim_q <= 64)
-        {
-            return std::make_tuple(64, 64);
-        }
-        else if(hdim_q <= 128)
-        {
-            return std::make_tuple(128, 128);
-        }
-        else if(hdim_q <= 192)
-        {
-            return std::make_tuple(192, 192);
-        }
+        return std::make_tuple(64, 64);
+    }
+    else if(hdim_q <= 128)
+    {
+        return std::make_tuple(128, 128);
+    }
+    else if(hdim_q <= 192)
+    {
+        return std::make_tuple(192, 192);
     }
 
+    assert(false);
     return std::make_tuple(hdim_q, hdim_v);
 }
 
@@ -137,7 +382,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                            a.hdim_v,
                            a.data_type,
                            a.is_group_mode,
-                           static_cast<mask_enum>(a.mask_type),
+                           static_cast<mask_enum>(a.ck_mask_type),
                            static_cast<bias_enum>(a.bias_type),
                            a.has_dbias,
                            a.has_dropout,
@@ -222,7 +467,7 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         /* split_stride_dq_acc*/ a.split_stride_dq_acc,
         /* window_size_left   */ a.window_size_left,
         /* window_size_right  */ a.window_size_right,
-        /* mask_type          */ a.mask_type,
+        /* mask_type          */ a.ck_mask_type,
         /* p_drop             */ a.p_drop,
         /* p_undrop           */ a.p_undrop,
         /* drop_seed_offset   */ a.drop_seed_offset,
@@ -251,40 +496,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
-    // ASM mask type
-    // 0: no mask
-    // 1: top-left triangular
-    // 2: bottom-right triangular
-    // 3: window mask
-    // -1: unsupported (e.g., ck generic mask)
-    auto asm_mask_type = [&]() {
-        if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::no_mask))
-        {
-            return 0;
-        }
-        else if(a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic))
-        {
-            // CK generic mask isn't supported here
-            return -1;
-        }
-        else
-        {
-            if(a.window_size_left == -1 && a.window_size_right == 0)
-            {
-                // Note: this case includes both top-left and bottom-right masks, but they share the same
-                // kernel selection logic in bwd since the attention sink isn't supported in bwd yet
-                return (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left)) ? 1 : 2;
-            }
-            else if(a.window_size_left == -1 && a.window_size_right == -1)
-            {
-                return 0;
-            }
-            else
-            {
-                return 3;
-            }
-        }
-    };
+    static bool use_ck_odo        = env_is_set("AITER_V3_BWD_CK_ODO");
+    static bool use_ck_dq_convert = env_is_set("AITER_V3_BWD_CK_DQ_CONVERT");
 
     auto pre_cfgs    = &cfg_fmha_bwd_odo;
     auto dqdkdv_cfgs = &cfg_fmha_bwd_dqdkdv;
@@ -316,30 +529,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     bool need_post_processing =
         ((arch_id == "gfx950") && (a.hdim_q != 64)) || (a.v3_atomic_fp32 == 1);
 
-    int mt = asm_mask_type();
-
-    if (mt == -1)
-    {
-        std::cout << "fmha_v3_bwd: unsupported mask type for asm kernels." << std::endl;
-        return -1;
-    }
-    // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
-    // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
-    // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
-    // existing a16 causal kernels.
-    // See config: hsa/gfx942/fmha_v3_bwd/fmha_bwd_dqdkdv.csv
-    if(arch_id == "gfx942" && !a.v3_atomic_fp32 && mt == 2 && a.seqlen_q == a.seqlen_k)
-    {
-        mt = 1;  // bottom-right → top-left (equivalent when sq == sk)
-    }
-
     auto [pre_kernel, dqdkdv_kernel, post_kernel] = get_heuristic_kernel(a.data_type,
                                                                          arch_id,
                                                                          a.seqlen_q,
                                                                          a.seqlen_k,
                                                                          a.hdim_q,
                                                                          a.hdim_v,
-                                                                         mt,
+                                                                         a.mask_type,
                                                                          a.v3_atomic_fp32,
                                                                          a.v3_bf16_cvt,
                                                                          a.is_group_mode,
@@ -347,14 +543,16 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((!use_ck_odo && pre_kernel == "") ||
+       (dqdkdv_kernel == "") ||
+       (need_post_processing && !use_ck_dq_convert && post_kernel == ""))
     {
         return -1;
     }
 
-    int ts_odo;
+    int ts_odo = 0;
     int ts_kv;
-    int ts_dq;
+    int ts_dq = 0;
     int arg_size;
 
     AiterAsmKernel* impl_ptr_pre    = nullptr;
@@ -362,25 +560,32 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     AiterAsmKernel* impl_ptr_post   = nullptr;
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
 
-    auto it_pre = pre_cfgs->find(pre_kernel);
-    if(it_pre != pre_cfgs->end())
+    if(!use_ck_odo)
     {
-        const auto& cfg     = it_pre->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_odo              = cfg.ts;
-
-        auto result = impl_ptr_map.emplace(name, nullptr);
-        if(result.second)
+        auto it_pre = pre_cfgs->find(pre_kernel);
+        if(it_pre != pre_cfgs->end())
         {
-            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
-        }
+            const auto& cfg     = it_pre->second;
+            const char* name    = cfg.knl_name.c_str();
+            const char* co_name = cfg.co_name.c_str();
+            ts_odo              = cfg.ts;
 
-        impl_ptr_pre = result.first->second.get();
+            auto result = impl_ptr_map.emplace(name, nullptr);
+            if(result.second)
+            {
+                result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+            }
+
+            impl_ptr_pre = result.first->second.get();
+        }
+        else
+        {
+            return -1;
+        }
     }
     else
     {
-        return -1;
+        std::cout << "[aiter] BWD ODO: using CK kernel" << std::endl;
     }
 
     auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
@@ -391,6 +596,10 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         const char* co_name = cfg.co_name.c_str();
         ts_kv               = cfg.ts;
 
+        // Debug: print which kernel is being used
+        std::cout << "[aiter] BWD kernel selected: " << co_name << " (knl: " << name << ")" << std::endl;
+        std::cout.flush();
+        
         auto result = impl_ptr_map.emplace(name, nullptr);
         if(result.second)
         {
@@ -404,7 +613,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         return -1;
     }
 
-    if(need_post_processing)
+    if(need_post_processing && !use_ck_dq_convert)
     {
         auto it_post = post_cfgs->find(post_kernel);
         if(it_post != post_cfgs->end())
@@ -427,35 +636,47 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             return -1;
         }
     }
+    else if(need_post_processing)
+    {
+        std::cout << "[aiter] BWD dQ_convert: using CK kernel" << std::endl;
+    }
 
     if(a.v3_api_check)
         return 1;
 
     fmha_bwd_odo_args odo_args;
-
-    odo_args.ptr_o           = a.o_ptr;
-    odo_args.ptr_do          = a.do_ptr;
-    odo_args.ptr_d           = a.d_ptr;
-    odo_args.Hs_odo          = a.nhead_stride_o * 2;
-    odo_args.BAs_odo         = a.batch_stride_o * 2;
-    odo_args.Seqs_odo        = a.stride_o * 2;
-    odo_args.Hs_d            = a.nhead_stride_lsed * 4;
-    odo_args.BAs_d           = a.batch_stride_lsed * 4;
-    odo_args.Seqs_d          = 1 * 4;
-    odo_args.seqlen_q        = a.seqlen_q;
-    odo_args.head_dim        = a.hdim_q;
-    odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
-    odo_args.ptr_qseq =
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    if(!use_ck_odo)
+    {
+        arg_size                 = sizeof(odo_args);
+        odo_args.ptr_o           = a.o_ptr;
+        odo_args.ptr_do          = a.do_ptr;
+        odo_args.ptr_d           = a.d_ptr;
+        odo_args.Hs_odo          = a.nhead_stride_o * 2;
+        odo_args.BAs_odo         = a.batch_stride_o * 2;
+        odo_args.Seqs_odo        = a.stride_o * 2;
+        odo_args.Hs_d            = a.nhead_stride_lsed * 4;
+        odo_args.BAs_d           = a.batch_stride_lsed * 4;
+        odo_args.Seqs_d          = 1 * 4;
+        odo_args.seqlen_q        = a.seqlen_q;
+        odo_args.head_dim        = a.hdim_q;
+        odo_args.ptr_qseq_padded = a.seqstart_q_ptr;
+        odo_args.ptr_qseq =
+            (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    }
 
     auto pre_kernel_launch = [&]() {
-        arg_size = sizeof(odo_args);
-        int bdx = 256;
-        int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
-        int gdy = a.nhead_q;
-        int gdz = a.batch;
-
-        impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        if(use_ck_odo)
+        {
+            launch_ck_odo(a, ck_tile::stream_config{s.stream_id_});
+        }
+        else
+        {
+            int bdx = 256;
+            int gdx = (a.max_seqlen_q + ts_odo - 1) / ts_odo;
+            int gdy = a.nhead_q;
+            int gdz = a.batch;
+            impl_ptr_pre->launch_kernel({&odo_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        }
     };
 
     fmha_bwd_dqdkdv_args dqdkdv_args;
@@ -520,7 +741,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     }
     dqdkdv_args.max_seqlen_dq = a.v3_atomic_fp32 ? a.max_seqlen_q : (a.max_seqlen_q + 15) / 16 * 16;
 
-    if(mt == 3)
+    if(a.mask_type == 3)
     {
         // Note: sink_size=0 is passed as the 3rd parameter (attention sink not supported in bwd
         // yet)
@@ -531,20 +752,20 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             sink_size,
             a.seqlen_q,
             a.seqlen_k,
-            (a.mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
-             a.mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
+            (a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::mask_top_left) ||
+             a.ck_mask_type == static_cast<ck_tile::index_t>(mask_enum::window_generic)));
         dqdkdv_args.mask_y = generic_mask.at(ck_tile::number<0>{});
         dqdkdv_args.mask_x = generic_mask.at(ck_tile::number<1>{});
     }
 
+    arg_size                  = sizeof(dqdkdv_args);
     auto dqdkdv_kernel_launch = [&]() {
-        arg_size                  = sizeof(dqdkdv_args);
         int bdx = 256;
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
-        if((mt == 1) || (mt == 2))
+        if((a.mask_type == 1) || (a.mask_type == 2))
         { // causal
             gdx = (gdx + 1) / 2;
         }
@@ -563,30 +784,38 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     int dq_acc_element_size = a.v3_atomic_fp32 ? 4 : 2;
     fmha_bwd_post_kernel_args post_args;
-
-    post_args.ptr_dq_acc      = a.dq_acc_ptr;
-    post_args.ptr_dq          = a.dq_ptr;
-    post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
-    post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
-    post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
-    post_args.Hs_dq           = a.nhead_stride_dq * 2;
-    post_args.BAs_dq          = a.batch_stride_dq * 2;
-    post_args.Seqs_dq         = a.stride_dq * 2;
-    post_args.seqlen_q        = a.seqlen_q;
-    post_args.head_dim        = a.hdim_q;
-    post_args.ptr_qseq_padded = a.seqstart_q_ptr;
-    post_args.ptr_qseq =
-        (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    if(!use_ck_dq_convert)
+    {
+        arg_size                  = sizeof(post_args);
+        post_args.ptr_dq_acc      = a.dq_acc_ptr;
+        post_args.ptr_dq          = a.dq_ptr;
+        post_args.Hs_dq_acc       = a.nhead_stride_dq_acc * dq_acc_element_size;
+        post_args.BAs_dq_acc      = a.batch_stride_dq_acc * dq_acc_element_size;
+        post_args.Seqs_dq_acc     = a.stride_dq_acc * dq_acc_element_size;
+        post_args.Hs_dq           = a.nhead_stride_dq * 2;
+        post_args.BAs_dq          = a.batch_stride_dq * 2;
+        post_args.Seqs_dq         = a.stride_dq * 2;
+        post_args.seqlen_q        = a.seqlen_q;
+        post_args.head_dim        = a.hdim_q;
+        post_args.ptr_qseq_padded = a.seqstart_q_ptr;
+        post_args.ptr_qseq =
+            (a.cu_seqlen_q_ptr && a.seqstart_q_ptr) ? a.cu_seqlen_q_ptr : a.seqstart_q_ptr;
+    }
 
     auto post_kernel_launch = [&]() {
-        arg_size                  = sizeof(post_args);
-        int bdx = 256;
-        int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
-        int gdy = a.nhead_q;
-        int gdz = a.batch;
-
-        impl_ptr_post->launch_kernel(
-            {&post_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        if(use_ck_dq_convert)
+        {
+            launch_ck_dq_convert(a, ck_tile::stream_config{s.stream_id_});
+        }
+        else
+        {
+            int bdx = 256;
+            int gdx = (a.max_seqlen_q + ts_dq - 1) / ts_dq;
+            int gdy = a.nhead_q;
+            int gdz = a.batch;
+            impl_ptr_post->launch_kernel(
+                {&post_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
+        }
     };
     return ck_tile::launch_kernel(
         s,
