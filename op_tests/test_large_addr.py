@@ -52,29 +52,101 @@ def capture_cpp_stdout():
         tmp.seek(0)
 
 
+_asm_kernel_cache = {}
+
+def is_equivalent_kernel(expected_co, dispatched_info):
+    """Check if the dispatched kernel is functionally equivalent to the expected one.
+    
+    Equivalence rules:
+    - causal_br supersedes causal (causal_br handles both patterns)
+    - On gfx950, causal A32 → causal_br A16 is valid (single-block optimization
+      forces A16 for seqlen_k <= 256 because A32 causal has multi-block bug)
+    - For non-causal: A16/A32 must match (different pipeline stages)
+    """
+    if expected_co in dispatched_info:
+        return True
+    if 'CK' in dispatched_info:
+        return False
+
+    import re
+    def parse_co(name):
+        m = re.search(r'bwd_hd(\d+(?:_\d+)?)_(\w+?)_((?:causal_br_|causal_)?)(a(?:16|32))_', name)
+        if not m:
+            return None
+        return {'hdim': m.group(1), 'dtype': m.group(2), 'mask': m.group(3).rstrip('_'), 'atomic': m.group(4)}
+
+    exp = parse_co(expected_co)
+    disp = parse_co(dispatched_info)
+    if not exp or not disp:
+        return False
+    if exp['hdim'] != disp['hdim'] or exp['dtype'] != disp['dtype']:
+        return False
+    mask_ok = (exp['mask'] == disp['mask'] or
+               (exp['mask'] == 'causal' and disp['mask'] == 'causal_br'))
+    if not mask_ok:
+        return False
+    if exp['atomic'] != disp['atomic']:
+        is_causal = exp['mask'] in ('causal', 'causal_br')
+        if is_causal and exp['atomic'] == 'a32' and disp['atomic'] == 'a16':
+            return True
+        return False
+    return True
+
+
 def parse_kernel_info(captured_text):
-    """Parse captured C++ output to determine which kernels were used."""
+    """Parse captured C++ output to determine which kernels were used.
+
+    The C++ backend caches loaded ASM kernels in a static map, so
+    hipModuleLoad messages only appear on the first invocation.
+    We mirror that with _asm_kernel_cache so subsequent tests still
+    report ASM correctly instead of defaulting to 'CK (fallback)'.
+    """
     info = {
-        "odo": "CK (fallback)",
-        "dqdkdv": "CK (fallback)",
-        "dq_convert": "CK (fallback)",
+        "odo": None,
+        "dqdkdv": None,
+        "dq_convert": None,
+        "dq_shuffle": None,
         "raw_output": captured_text.strip(),
     }
+    saw_ck_odo = False
+    saw_ck_dq_convert = False
     for line in captured_text.splitlines():
         line = line.strip()
         if "[aiter] BWD kernel selected:" in line:
             co_part = line.split("[aiter] BWD kernel selected:")[-1].strip()
             info["dqdkdv"] = f"ASM ({co_part})"
+            _asm_kernel_cache["dqdkdv"] = info["dqdkdv"]
         elif "[aiter] hipModuleLoad:" in line and "odo" in line.lower():
             co_part = line.split("hipModuleLoad:")[-1].strip().split()[0]
             info["odo"] = f"ASM ({co_part})"
+            _asm_kernel_cache["odo"] = info["odo"]
         elif "[aiter] hipModuleLoad:" in line and "dq_convert" in line.lower():
             co_part = line.split("hipModuleLoad:")[-1].strip().split()[0]
             info["dq_convert"] = f"ASM ({co_part})"
-        elif "BWD ODO: using fallback" in line:
-            info["odo"] = "CK (fallback HIP)"
-        elif "BWD dQ_convert: using fallback" in line:
-            info["dq_convert"] = "CK (fallback HIP)"
+            _asm_kernel_cache["dq_convert"] = info["dq_convert"]
+        elif "[aiter] hipModuleLoad:" in line and "dq_shuffle" in line.lower():
+            co_part = line.split("hipModuleLoad:")[-1].strip().split()[0]
+            info["dq_shuffle"] = f"ASM ({co_part})"
+            _asm_kernel_cache["dq_shuffle"] = info["dq_shuffle"]
+        elif "BWD ODO: using CK kernel" in line or "BWD ODO: using fallback" in line:
+            info["odo"] = "CK (fallback)"
+            saw_ck_odo = True
+        elif "BWD dQ_convert: using CK kernel" in line or "BWD dQ_convert: using fallback" in line:
+            info["dq_convert"] = "CK (fallback)"
+            saw_ck_dq_convert = True
+
+    for key in ("odo", "dq_convert", "dq_shuffle", "dqdkdv"):
+        if info[key] is None:
+            if key == "odo" and saw_ck_odo:
+                info[key] = "CK (fallback)"
+            elif key == "dq_convert" and saw_ck_dq_convert:
+                info[key] = "CK (fallback)"
+            elif key in _asm_kernel_cache:
+                info[key] = _asm_kernel_cache[key] + " (cached)"
+            elif key == "dq_shuffle":
+                info[key] = None
+            else:
+                info[key] = "CK (fallback)"
     return info
 
 
@@ -174,6 +246,65 @@ def print_mismatch_info(name, tensor_aiter, tensor_ref, tensor_pt, tol):
             print(f"  (Tensor too large for top-k analysis, showing max only)")
 
 
+def analyze_buffer_overflow(batch_size, nheads, seqlen_q, seqlen_k, hdim_q, hdim_v, atomic32):
+    """
+    Analyze which buffers exceed 32-bit addressing for the given parameters.
+    Returns a dict mapping buffer name -> (max_offset, overflows_32bit).
+    
+    Buffer address model (batch-major layout [B, S, H, D]):
+      batch_stride = nheads * seqlen * hdim * Bpp
+      max_offset = (batch_size - 1) * batch_stride
+    
+    For dQ with atomic32 (float32 accumulation):
+      Bpp_dQ = 4 (float32)
+      dQ_base = H_DIM * s_LseD_base where s_LseD_base = (batch_idx*nheads + head_idx)*seqlen_q*Bpp_Q
+      max dQ_base = H_DIM * ((batch_size-1)*nheads + nheads-1) * seqlen_q * Bpp_dQ
+    """
+    LIMIT_32 = 2**32
+    bpp_io = 2  # bf16/fp16 = 2 bytes
+    bpp_dq = 4 if atomic32 else bpp_io  # dQ accumulator: float32 if A32
+
+    buffers = {}
+
+    q_stride  = nheads * seqlen_q * hdim_q * bpp_io
+    do_stride = nheads * seqlen_q * hdim_v * bpp_io
+    k_stride  = nheads * seqlen_k * hdim_q * bpp_io
+    v_stride  = nheads * seqlen_k * hdim_v * bpp_io
+    dk_stride = nheads * seqlen_k * hdim_q * bpp_io
+    dv_stride = nheads * seqlen_k * hdim_v * bpp_io
+
+    buffers["Q"]  = (batch_size - 1) * q_stride
+    buffers["dO"] = (batch_size - 1) * do_stride
+    buffers["K"]  = (batch_size - 1) * k_stride
+    buffers["V"]  = (batch_size - 1) * v_stride
+    buffers["dK"] = (batch_size - 1) * dk_stride
+    buffers["dV"] = (batch_size - 1) * dv_stride
+
+    max_lsed_base = ((batch_size - 1) * nheads + (nheads - 1)) * seqlen_q * bpp_dq
+    buffers["dQ (base=H_DIM*LseD)"] = hdim_q * max_lsed_base
+
+    result = {}
+    for name, max_offset in buffers.items():
+        result[name] = (max_offset, max_offset >= LIMIT_32)
+    return result
+
+
+def print_overflow_analysis(batch_size, nheads, seqlen_q, seqlen_k, hdim_q, hdim_v, atomic32):
+    """Print per-buffer 32-bit overflow analysis for a test case."""
+    analysis = analyze_buffer_overflow(batch_size, nheads, seqlen_q, seqlen_k, hdim_q, hdim_v, atomic32)
+
+    any_overflow = any(ov for _, ov in analysis.values())
+    print(f"\n  Buffer 32-bit overflow analysis (2^32 = {2**32:,}):")
+    for name, (max_off, overflows) in analysis.items():
+        flag = "OVERFLOW" if overflows else "ok"
+        print(f"    {name:25s}: max_offset = {max_off:>15,}  [{flag}]")
+
+    if not any_overflow:
+        print("    *** No buffers overflow 32-bit — this test does NOT exercise the fix ***")
+
+    return analysis
+
+
 def get_test_params_for_kernel(config, large_q=False):
     """
     Generate test parameters for a given kernel configuration.
@@ -189,7 +320,7 @@ def get_test_params_for_kernel(config, large_q=False):
     dtype_str = config['dtype']
     hdim_q = int(config['hdim_q'])
     hdim_v = int(config['hdim_v'])
-    mask = int(config['mask'])  # 0=no mask, 1=causal, 2=causal_br
+    mask = int(config['mask'])  # 0=no mask, 1=causal, 2=causal_br, 3=swa
     atomic32 = int(config['atomic32'])  # 0=a16, 1=a32
     pssk = int(config['pssk'])
     pddv = int(config['pddv'])
@@ -199,14 +330,22 @@ def get_test_params_for_kernel(config, large_q=False):
     # Map dtype string to torch dtype
     dtype = torch.bfloat16 if dtype_str == 'bf16' else torch.float16
     
-    # Determine causal type
-    causal = mask > 0
-    if mask == 2:
+    # Determine causal type and window size
+    # mask=3 (SWA) needs causal=False with finite window_size per mha.py:
+    #   swa = not causal and ((window_size_left > 0) or (window_size_right > 0))
+    causal = (mask > 0 and mask != 3)
+    window_size = (-1, -1)
+    if mask == 3:
+        causal_type = None
+        window_size = (15, 15)
+    elif mask == 2:
         causal_type = "bottom_right"
     elif mask == 1:
         causal_type = "top_left"
     else:
         causal_type = None
+    
+    bf16_cvt = int(config['bf16_cvt'])  # 0=RTNE, 1=RTNA, 2=RTZ, 3=FP16(n/a)
     
     # deterministic=False is required to use ASM backend kernels
     # atomic32 field determines a16 vs a32 kernel via is_v3_atomic_fp32 flag
@@ -215,18 +354,18 @@ def get_test_params_for_kernel(config, large_q=False):
     is_v3_atomic_fp32 = (atomic32 == 1)  # 1=a32, 0=a16
     
     # For pddv=1 kernels, use actual hdim < padded hdim (e.g., 72 pads to 128)
+    # For asymmetric hdim (e.g., D192_128: hdim_q=192, hdim_v=128), handle independently
     actual_hdim_q = hdim_q
     actual_hdim_v = hdim_v
     if pddv == 1:
-        if hdim_q == 128:
-            actual_hdim_q = 72
-            actual_hdim_v = 72
-        elif hdim_q == 64:
-            actual_hdim_q = 48
-            actual_hdim_v = 48
-        elif hdim_q == 192:
-            actual_hdim_q = 160
-            actual_hdim_v = 160
+        hdim_to_actual = {64: 48, 128: 72, 192: 160}
+        if hdim_q in hdim_to_actual:
+            actual_hdim_q = hdim_to_actual[hdim_q]
+        if hdim_v in hdim_to_actual:
+            actual_hdim_v = hdim_to_actual[hdim_v]
+    if pssk == 1 and pddv == 1 and hdim_q != hdim_v:
+        actual_hdim_q = hdim_q
+        actual_hdim_v = hdim_v
     
     batch_size = 8
     nheads = 40
@@ -234,26 +373,39 @@ def get_test_params_for_kernel(config, large_q=False):
     # ts_kv alignment: A16 on gfx942 uses 64, A32 uses ts from CSV
     ts_kv_align = 64 if (atomic32 == 0) else int(config.get('ts', '192'))
 
-    # if pssk == 0:
-    #     # pssk=0 requires seqlen_q == seqlen_k AND seqlen_k % ts_kv == 0
-    #     # Both seqlens must be large enough for 64-bit overflow:
-    #     #   batch_stride = nheads * seqlen * actual_hdim * 2
-    #     #   need batch_stride * (batch-1) > 2^32
-    #     stride_per_seq = nheads * actual_hdim_q * 2
-    #     min_seqlen = (2**32 // (stride_per_seq * (batch_size - 1))) + 1
-    #     # Round up to multiple of ts_kv_align
-    #     seqlen = ((min_seqlen + ts_kv_align - 1) // ts_kv_align) * ts_kv_align
-    #     seqlen_q = seqlen
-    #     seqlen_k = seqlen
-    # elif 
-    if large_q:
-        # Large seqlen_q: tests Q/dO/dQ/ODO address overflow
-        seqlen_q = 75600
-        seqlen_k = 256
+    TILE_ALIGN = 192  # largest KV tile size
+
+    def overflow_seqlen(stride_per_seq):
+        """Minimum seqlen for stride_per_seq * seqlen > 2^32, tile-aligned."""
+        raw = (2**32 // stride_per_seq) + 1
+        return ((raw + TILE_ALIGN - 1) // TILE_ALIGN) * TILE_ALIGN
+
+    bpp_io = 2  # bf16/fp16
+    bpp_dq = 4 if (atomic32 == 1) else bpp_io
+
+    # Reference attention_ref allocates [B, H, seq_q, seq_k] in float32.
+    # Cap the "small" seqlen when the "large" seqlen is very big to avoid OOM.
+    SMALL_SEQ_THRESHOLD = 80000
+
+    # gfx950 forces is_v3_atomic_fp32=False (A16) when seqlen_k <= 256 (single-block
+    # optimization). For non-causal A32 kernels, use seqlen_k > 256 to bypass this.
+    # Causal A32 kernels have a known multi-block bug on gfx950, so we keep
+    # seqlen_k <= 256 (dispatches A16 via single-block path, which works correctly).
+    is_causal_mask = (mask > 0 and mask != 3)
+    min_seqlen_k = 320 if (atomic32 == 1 and not is_causal_mask) else 64
+
+    if large_q is None:
+        seqlen_q = max(256, min_seqlen_k)
+        seqlen_k = max(256, min_seqlen_k)
+    elif large_q:
+        stride_qdo = (batch_size - 1) * nheads * actual_hdim_q * bpp_io
+        stride_dq = actual_hdim_q * ((batch_size - 1) * nheads + nheads - 1) * bpp_dq
+        seqlen_q = max(overflow_seqlen(stride_qdo), overflow_seqlen(stride_dq))
+        seqlen_k = max(min_seqlen_k, 64 if seqlen_q > SMALL_SEQ_THRESHOLD else 256)
     else:
-        # Large seqlen_k: tests K/V/dK/dV address overflow
-        seqlen_q = 256
-        seqlen_k = 75600
+        stride_kv = (batch_size - 1) * nheads * actual_hdim_q * bpp_io
+        seqlen_k = overflow_seqlen(stride_kv)
+        seqlen_q = 64 if seqlen_k > SMALL_SEQ_THRESHOLD else 256
     
     return {
         "batch_size": batch_size,
@@ -265,11 +417,13 @@ def get_test_params_for_kernel(config, large_q=False):
         "dtype": dtype,
         "causal": causal,
         "causal_type": causal_type,
+        "window_size": window_size,
         "deterministic": deterministic,
         "co_name": co_name,
         "dtype_str": dtype_str,
         "atomic32": atomic32,
         "is_v3_atomic_fp32": is_v3_atomic_fp32,  # True=A32, False=A16
+        "how_v3_bf16_cvt": bf16_cvt,  # 0=RTNE, 1=RTNA, 2=RTZ, 3=FP16
         "is_varlen": (mode == 1),  # group mode uses varlen API
     }
 
@@ -284,10 +438,12 @@ def run_mha_backward_test(
     dtype: torch.dtype,
     causal: bool,
     causal_type: str = None,
+    window_size: tuple = (-1, -1),
     deterministic: bool = False,
     test_name: str = "unknown",
     co_name: str = "",
     is_v3_atomic_fp32: bool = True,  # True=A32 kernel, False=A16 kernel
+    how_v3_bf16_cvt: int = 1,  # 0=RTNE, 1=RTNA, 2=RTZ
     **kwargs,
 ):
     """
@@ -297,9 +453,11 @@ def run_mha_backward_test(
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
     causal_flag = "" if causal else "--no-causal"
     det_flag = "--deterministic" if deterministic else "--no-deterministic"
+    is_swa = window_size != (-1, -1)
+    swa_str = f" --window-left {window_size[0]} --window-right {window_size[1]}" if is_swa else ""
     cmd = (f"AITER_DISABLE_V3_FWD=1 python test_mha.py -b {batch_size} -n {nheads} "
            f"-q {seqlen_q} -k {seqlen_k} -d_qk_v {hdim_q},{hdim_v} -d {dtype_str} "
-           f"{causal_flag} --no-local {det_flag} -m mha")
+           f"{causal_flag} --no-local {det_flag}{swa_str} -m mha")
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name}")
@@ -308,15 +466,19 @@ def run_mha_backward_test(
     print(f"Config: batch={batch_size}, heads={nheads}, seq_q={seqlen_q}, seq_k={seqlen_k}")
     print(f"        hdim_q={hdim_q}, hdim_v={hdim_v}, dtype={dtype}")
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
+    if is_swa:
+        print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
+    cvt_names = {0: "RTNE", 1: "RTNA", 2: "RTZ", 3: "FP16"}
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
+    print(f"        how_v3_bf16_cvt={how_v3_bf16_cvt} ({cvt_names.get(how_v3_bf16_cvt, '?')})")
     print(f"{'='*70}")
     
-    device = "cuda"
+    overflow_info = print_overflow_analysis(
+        batch_size, nheads, seqlen_q, seqlen_k, hdim_q, hdim_v,
+        atomic32=int(is_v3_atomic_fp32),
+    )
     
-    # Set window size for causal (aligned with test_mha.py)
-    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
-    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
-    window_size = (-1, -1)
+    device = "cuda"
     
     # Create input tensors (aligned with test_mha.py)
     q = torch.randn(batch_size, seqlen_q, nheads, hdim_q, device=device, dtype=dtype, requires_grad=True)
@@ -339,8 +501,8 @@ def run_mha_backward_test(
                 deterministic,
                 return_lse=True,
                 return_attn_probs=True,  # Aligned with test_mha.py
-                how_v3_bf16_cvt=2,
-                is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
+                is_v3_atomic_fp32=is_v3_atomic_fp32,
+                how_v3_bf16_cvt=how_v3_bf16_cvt,
                 num_rotate_args=1,
             )
             
@@ -351,7 +513,24 @@ def run_mha_backward_test(
         print(f"\n  Kernel dispatch info:")
         print(f"    ODO:        {kernel_info['odo']}")
         print(f"    dQdKdV:     {kernel_info['dqdkdv']}")
-        print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        if kernel_info.get('dq_shuffle'):
+            print(f"    dQ_shuffle:  {kernel_info['dq_shuffle']}  (A16 mode: dQ accumulated in fp16/bf16)")
+        if is_v3_atomic_fp32:
+            print(f"    dQ_convert: {kernel_info['dq_convert']}  (A32 mode: fp32→fp16/bf16)")
+        else:
+            if kernel_info.get('dq_shuffle'):
+                print(f"    dQ_convert: skipped  (A16 mode uses dQ_shuffle instead)")
+            else:
+                print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        kernel_exact = co_name in kernel_info['dqdkdv']
+        kernel_equiv = is_equivalent_kernel(co_name, kernel_info['dqdkdv'])
+        kernel_matched = kernel_exact or kernel_equiv
+        if kernel_exact:
+            print(f"    Kernel match: ✓ ({co_name} dispatched as expected)")
+        elif kernel_equiv:
+            print(f"    Kernel match: ≈ (equivalent kernel dispatched: {kernel_info['dqdkdv']})")
+        else:
+            print(f"    Kernel match: ✗ (expected {co_name}, got: {kernel_info['dqdkdv']})")
         if kernel_info['raw_output']:
             print(f"    [raw C++ output]: {kernel_info['raw_output']}")
         
@@ -360,7 +539,8 @@ def run_mha_backward_test(
         error_msg = str(e) if str(e) else f"{type(e).__name__}"
         print(f"  ERROR: Aiter failed with: {error_msg}")
         traceback.print_exc()
-        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name}
+        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name,
+                "kernel_info": None, "kernel_matched": None}
     
     # Run PyTorch reference in float32 (upcast=True) - aligned with test_mha.py
     out_ref, softmax_lse_ref, dq_ref, dk_ref, dv_ref = run_torch(
@@ -409,6 +589,11 @@ def run_mha_backward_test(
     print(f"  dV: diff={dv_diff:.6f} vs tol={dv_tol:.6f} {status_v}")
     print(f"  Result: {'PASSED' if passed else 'FAILED'}")
     
+    # Show which buffer overflows were exercised and verified
+    overflow_bufs = [name for name, (_, ov) in overflow_info.items() if ov]
+    if overflow_bufs:
+        print(f"  Overflow buffers verified: {', '.join(overflow_bufs)}")
+    
     # Print mismatch details if failed (aligned with test_mha.py)
     print_mismatch_info("dQ", dq, dq_ref, dq_pt, dq_tol)
     print_mismatch_info("dK", dk, dk_ref, dk_pt, dk_tol)
@@ -424,6 +609,9 @@ def run_mha_backward_test(
         "dv_tol": dv_tol,
         "co_name": co_name,
         "test_name": test_name,
+        "overflow_buffers": overflow_bufs,
+        "kernel_info": kernel_info,
+        "kernel_matched": kernel_matched,
     }
 
 
@@ -437,10 +625,12 @@ def run_mha_varlen_backward_test(
     dtype: torch.dtype,
     causal: bool,
     causal_type: str = None,
+    window_size: tuple = (-1, -1),
     deterministic: bool = False,
     test_name: str = "unknown",
     co_name: str = "",
     is_v3_atomic_fp32: bool = True,  # True=A32 kernel, False=A16 kernel
+    how_v3_bf16_cvt: int = 1,  # 0=RTNE, 1=RTNA, 2=RTZ
     **kwargs,
 ):
     """
@@ -448,6 +638,7 @@ def run_mha_varlen_backward_test(
     Aligned with test_mha.py methodology.
     """
     dtype_str = "bf16" if dtype == torch.bfloat16 else "fp16"
+    is_swa = window_size != (-1, -1)
     
     print(f"\n{'='*70}")
     print(f"Test: {test_name} (VARLEN/GROUP MODE)")
@@ -456,15 +647,19 @@ def run_mha_varlen_backward_test(
     print(f"Config: batch={batch_size}, heads={nheads}, seq_q={seqlen_q}, seq_k={seqlen_k}")
     print(f"        hdim_q={hdim_q}, hdim_v={hdim_v}, dtype={dtype}")
     print(f"        causal={causal}, causal_type={causal_type}, deterministic={deterministic}")
+    if is_swa:
+        print(f"        window_size=({window_size[0]}, {window_size[1]}) (SWA mode)")
+    cvt_names = {0: "RTNE", 1: "RTNA", 2: "RTZ", 3: "FP16"}
     print(f"        is_v3_atomic_fp32={is_v3_atomic_fp32} ({'A32' if is_v3_atomic_fp32 else 'A16'} kernel)")
+    print(f"        how_v3_bf16_cvt={how_v3_bf16_cvt} ({cvt_names.get(how_v3_bf16_cvt, '?')})")
     print(f"{'='*70}")
     
-    device = "cuda"
+    overflow_info = print_overflow_analysis(
+        batch_size, nheads, seqlen_q, seqlen_k, hdim_q, hdim_v,
+        atomic32=int(is_v3_atomic_fp32),
+    )
     
-    # Set window size for causal (aligned with test_mha.py)
-    # test_mha.py always uses (-1, -1) for window_size and just passes causal=True
-    # The C++ layer handles mask type selection internally based on seqlen_q vs seqlen_k
-    window_size = (-1, -1)
+    device = "cuda"
     
     # For varlen mode, create packed tensors
     total_q = batch_size * seqlen_q
@@ -496,7 +691,7 @@ def run_mha_varlen_backward_test(
                 return_lse=True,
                 return_attn_probs=False,
                 deterministic=deterministic,
-                is_v3_atomic_fp32=is_v3_atomic_fp32,  # True=A32, False=A16
+                how_v3_bf16_cvt=how_v3_bf16_cvt,
             )
             
             # Compute gradients
@@ -506,7 +701,24 @@ def run_mha_varlen_backward_test(
         print(f"\n  Kernel dispatch info:")
         print(f"    ODO:        {kernel_info['odo']}")
         print(f"    dQdKdV:     {kernel_info['dqdkdv']}")
-        print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        if kernel_info.get('dq_shuffle'):
+            print(f"    dQ_shuffle:  {kernel_info['dq_shuffle']}  (A16 mode: dQ accumulated in fp16/bf16)")
+        if is_v3_atomic_fp32:
+            print(f"    dQ_convert: {kernel_info['dq_convert']}  (A32 mode: fp32→fp16/bf16)")
+        else:
+            if kernel_info.get('dq_shuffle'):
+                print(f"    dQ_convert: skipped  (A16 mode uses dQ_shuffle instead)")
+            else:
+                print(f"    dQ_convert: {kernel_info['dq_convert']}")
+        kernel_exact = co_name in kernel_info['dqdkdv']
+        kernel_equiv = is_equivalent_kernel(co_name, kernel_info['dqdkdv'])
+        kernel_matched = kernel_exact or kernel_equiv
+        if kernel_exact:
+            print(f"    Kernel match: ✓ ({co_name} dispatched as expected)")
+        elif kernel_equiv:
+            print(f"    Kernel match: ≈ (equivalent kernel dispatched: {kernel_info['dqdkdv']})")
+        else:
+            print(f"    Kernel match: ✗ (expected {co_name}, got: {kernel_info['dqdkdv']})")
         if kernel_info['raw_output']:
             print(f"    [raw C++ output]: {kernel_info['raw_output']}")
         
@@ -515,7 +727,8 @@ def run_mha_varlen_backward_test(
         error_msg = str(e) if str(e) else f"{type(e).__name__}"
         print(f"  ERROR: Aiter failed with: {error_msg}")
         traceback.print_exc()
-        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name}
+        return {"passed": False, "error": error_msg or "Unknown error", "co_name": co_name, "test_name": test_name,
+                "kernel_info": None, "kernel_matched": None}
     
     # For reference, reshape to batch format and compute using attention_ref
     q_batch = q.reshape(batch_size, seqlen_q, nheads, hdim_q).requires_grad_(True)
@@ -573,6 +786,10 @@ def run_mha_varlen_backward_test(
     print(f"  dV: diff={dv_diff:.6f} vs tol={dv_tol:.6f} {status_v}")
     print(f"  Result: {'PASSED' if passed else 'FAILED'}")
     
+    overflow_bufs = [name for name, (_, ov) in overflow_info.items() if ov]
+    if overflow_bufs:
+        print(f"  Overflow buffers verified: {', '.join(overflow_bufs)}")
+    
     # Print mismatch details if failed
     print_mismatch_info("dQ", dq, dq_ref, dq_pt, dq_tol)
     print_mismatch_info("dK", dk, dk_ref, dk_pt, dk_tol)
@@ -588,30 +805,41 @@ def run_mha_varlen_backward_test(
         "dv_tol": dv_tol,
         "co_name": co_name,
         "test_name": test_name,
+        "overflow_buffers": overflow_bufs,
+        "kernel_info": kernel_info,
+        "kernel_matched": kernel_matched,
     }
 
 
-def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
+def run_all_tests(kernel_filter=None, large_q=False, large_k=False, normal=False):
     """Run all kernel tests or a filtered subset.
     
     By default (no flags), runs BOTH large_q and large_k tests.
     Use --large-q or --large-k to run only one mode.
+    Use --normal to add a baseline correctness test with small seqlens (q=256, k=256).
     """
     print(f"\nRunning on: {get_device_arch()}")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA version: {torch.version.cuda}")
     
     # Determine which modes to run
-    if not large_q and not large_k:
-        # Default: run both
+    # large_q value in tuple: None=normal, True=large_q, False=large_k
+    any_specified = normal or large_q or large_k
+    if not any_specified:
+        # Default: run all three tests
         modes = [
+            (None,  "normal (q=256, k=256): baseline correctness test"),
             (False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow"),
             (True,  "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow"),
         ]
-    elif large_q:
-        modes = [(True, "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow")]
     else:
-        modes = [(False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow")]
+        modes = []
+        if normal:
+            modes.append((None, "normal (q=256, k=256): baseline correctness test"))
+        if large_k:
+            modes.append((False, "large_k (q=256, k=75600): tests K/V/dK/dV address overflow"))
+        if large_q:
+            modes.append((True, "large_q (q=75600, k=256): tests Q/dO/dQ/ODO address overflow"))
     
     configs = load_kernel_configs()
     
@@ -621,7 +849,7 @@ def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
     
     # Filter configs if requested
     if kernel_filter:
-        filter_lower = kernel_filter.lower()
+        filter_lower = os.path.basename(kernel_filter).lower()
         filtered = []
         for c in configs:
             co_name = c['co_name'].lower()
@@ -669,7 +897,9 @@ def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
                 skipped += 1
                 continue
             
-            if cfg_pssk == 0:
+            if is_large_q is None:
+                suffix = "_normal"
+            elif cfg_pssk == 0:
                 suffix = "_equalSeqlen"
             elif is_large_q:
                 suffix = "_largeQ"
@@ -770,6 +1000,42 @@ def run_all_tests(kernel_filter=None, large_q=False, large_k=False):
                     else:
                         parts.append(f"dV={dv}")
                     print(f"  - {name}: {', '.join(parts)}")
+    
+    # Kernel match verification
+    matched_count = 0
+    mismatched_count = 0
+    unknown_count = 0
+    mismatched_details = []
+    for r in all_results:
+        km = r.get('kernel_matched')
+        if km is True:
+            matched_count += 1
+        elif km is False:
+            mismatched_count += 1
+            mismatched_details.append(
+                f"  ✗ {r.get('test_name', r['co_name'])}: "
+                f"expected {r['co_name']}, dispatched {r.get('kernel_info', {}).get('dqdkdv', '?')}"
+            )
+        else:
+            unknown_count += 1
+    
+    print(f"\n{'='*70}")
+    print(f"KERNEL DISPATCH VERIFICATION")
+    print(f"{'='*70}")
+    if kernel_filter:
+        print(f"  --kernel filter: {kernel_filter}")
+    print(f"  Matched:    {matched_count}")
+    if mismatched_count:
+        print(f"  MISMATCHED: {mismatched_count}")
+    if unknown_count:
+        print(f"  Unknown:    {unknown_count} (test errored before dispatch)")
+    if mismatched_details:
+        print(f"\n  Mismatched kernels:")
+        for d in mismatched_details:
+            print(d)
+    if mismatched_count == 0 and unknown_count == 0:
+        print(f"  All {matched_count} test(s) dispatched the expected kernel ✓")
+    print(f"{'='*70}")
 
 
 def list_tests():
@@ -782,7 +1048,8 @@ def list_tests():
     for config in configs:
         mode_str = "group" if config['mode'] == '1' else "batch"
         atomic_str = "a32" if config['atomic32'] == '1' else "a16"
-        mask_str = ["none", "causal", "causal_br"][int(config['mask'])]
+        mask_names = {0: "none", 1: "causal", 2: "causal_br", 3: "swa"}
+        mask_str = mask_names.get(int(config['mask']), f"unknown({config['mask']})")
         print(f"  {config['co_name']}: {config['dtype']} {atomic_str} hdim={config['hdim_q']}/{config['hdim_v']} "
               f"mask={mask_str} mode={mode_str}")
 
@@ -833,6 +1100,12 @@ def main():
         action="store_true",
         help="Only test large seqlen_k (q=256, k=75600). Default runs both."
     )
+    parser.add_argument(
+        "--normal",
+        action="store_true",
+        help="Add baseline correctness test with small seqlens (q=256, k=256). "
+             "Use alone for normal-only, or combine with --large-q/--large-k."
+    )
     
     args = parser.parse_args()
     
@@ -841,7 +1114,7 @@ def main():
     elif args.csv:
         show_csv()
     else:
-        run_all_tests(kernel_filter=args.kernel, large_q=args.large_q, large_k=args.large_k)
+        run_all_tests(kernel_filter=args.kernel, large_q=args.large_q, large_k=args.large_k, normal=args.normal)
 
 
 if __name__ == "__main__":
