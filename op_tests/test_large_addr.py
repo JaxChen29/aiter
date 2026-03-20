@@ -391,8 +391,15 @@ def get_test_params_for_kernel(config, large_q=False):
     # optimization). For non-causal A32 kernels, use seqlen_k > 256 to bypass this.
     # Causal A32 kernels have a known multi-block bug on gfx950, so we keep
     # seqlen_k <= 256 (dispatches A16 via single-block path, which works correctly).
+    # On gfx942, no single-block constraint exists, so seqlen_k=64 works for all
+    # kernels and avoids OOM in attention_ref (scores matrix [B,H,sq,sk] in fp32).
     is_causal_mask = (mask > 0 and mask != 3)
-    min_seqlen_k = 320 if (atomic32 == 1 and not is_causal_mask) else 64
+    arch = get_device_arch()
+    is_gfx950 = "gfx950" in arch
+    if is_gfx950:
+        min_seqlen_k = 320 if (atomic32 == 1 and not is_causal_mask) else 64
+    else:
+        min_seqlen_k = 64
 
     if large_q is None:
         seqlen_q = max(256, min_seqlen_k)

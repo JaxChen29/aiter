@@ -1899,6 +1899,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt=1,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_kv: Optional[torch.Tensor] = None,
@@ -1969,7 +1970,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        True,  # is_v3_atomic_fp32
+        is_v3_atomic_fp32,
         how_v3_bf16_cvt,
         cu_seqlens_q,
         cu_seqlens_kv,
