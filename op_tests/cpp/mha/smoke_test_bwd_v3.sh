@@ -3,21 +3,54 @@
 #!/bin/sh
 EXE="$(find . -name bwd.exe -type f | head -n 1)"
 KNAME=1
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+TOP_DIR=$(dirname "$SCRIPT_DIR")/../../
 
 export CK_WARMUP=0
 export CK_REPEAT=1
+export AITER_ASM_DIR="${TOP_DIR}/hsa"
+export LD_LIBRARY_PATH="${SCRIPT_DIR}:${LD_LIBRARY_PATH}"
 
 COMMON_ARGS='-v=1'
 
+layout_args_for_case() {
+    case "$1" in
+        0) echo "-iperm=0 -operm=0" ;;
+        1) echo "-iperm=1 -operm=1" ;;
+        2) echo "-ilayout=2 -olayout=2" ;;
+        *)
+            echo "unsupported layout case: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+run_targeted_sbhd_a16_regression() {
+    echo "===== Targeted SBHD A16 regression ====="
+
+    SBHD_ARGS="$(layout_args_for_case 2)" || return 1
+    BHSD_ARGS="$(layout_args_for_case 1)" || return 1
+
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=64 -s=512 $SBHD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=0 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=64 -s=512 $BHSD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=0 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=64 -s=512 $SBHD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=1 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=128 -s=512 $SBHD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=0 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=128 -s=512 $BHSD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=0 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=16 -h_k=2 -d=128 -s=512 $SBHD_ARGS -mask=1 -bwd_v3=1 -v3_atomic_fp32=1 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+}
+
 run_batch_mode_tests() {
     for prec in "fp16" "bf16" ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
     for hdim in 64 72 96 128 144 176 192 ; do
     for sq in 64 192 200 ; do
     for sk in 33 64 192 ; do
     for v3_atomic_fp32 in 0 1 ; do
     for v3_bf16_cvt in 0 1 2 ; do
     for mask in 0 "t" "b" ; do
+
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
 
     if [ $v3_atomic_fp32 -eq 0 ] && ([ $sq -ne $sk ] || [ $(($sk % 64)) -ne 0 ]); then
         echo "skip atomic16 cases for sq!=sk or sk%64!=0"
@@ -39,7 +72,7 @@ run_batch_mode_tests() {
         continue
     fi
 
-    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=$hdim -s=$sq -s_k=$sk $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -53,14 +86,16 @@ run_batch_mode_tests() {
 
 run_swa_tests() {
     for prec in "bf16" "fp16" ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
     for seqlen_q in 192 301 512 700; do
     for seqlen_k in 192 301 512 700; do
     for hdim in 72 96 128 ; do
     for mask in "t:-1,10" "t:15,-1" "t:15,15" "t:190,187" "b:-1,10" "b:15,-1" "b:15,15" "b:190,187" ; do
 
-    $EXE -prec=$prec -b=2 -h=3 -h_k=1 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=2 -h=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
+
+    $EXE -prec=$prec -b=2 -h=3 -h_k=1 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=2 -d=$hdim -s=$seqlen_q -s_k=$seqlen_k $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -73,18 +108,20 @@ run_swa_tests() {
 run_group_mode_tests() {
     for sk in 63 127 200; do
     for prec in "bf16" "fp16" ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
     for hdim in 64 80 96 120 128 144 160 192; do
     for mask in 0 "t" "b" ; do
     for v3_bf16_cvt in 0 1 2 ; do #valid for bf16. Pls set CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT in config.hpp to the corresponding value and re-test if a small number of slight mimatchs occurred
+
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
 
     if [ $prec = "fp16" ] && [ $v3_bf16_cvt -gt 0 ]; then
         echo "skip fp16 with bf16_convert cases"
         continue
     fi
 
-    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=65 -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=1 -h=4 -h_k=1 -d=$hdim -s=129 -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=65 -s_k=$sk $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=1 -h=4 -h_k=1 -d=$hdim -s=129 -s_k=$sk $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -v3_atomic_fp32=1 -mode=1 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -104,7 +141,9 @@ run_gfx950_bwd_v3() {
     for head in 2 4 ; do
     for sq in 62 174 ; do
     for sk in 65 174 299 577 ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
+
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
 
     hdim_v=$hdim
     if [ $hdim -eq 192 ]; then
@@ -114,7 +153,7 @@ run_gfx950_bwd_v3() {
         fi
     fi
 
-    $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -133,10 +172,12 @@ run_gfx950_group_bwd_v3() {
     for v3_atomic_fp32 in 0 1 ; do
     for seqlen in 65 174 299 577; do
     for hdim in 80 120 128 ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
 
-    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=$prec -b=3 -h=4 -h_k=1 -d=$hdim -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
+
+    $EXE -prec=$prec -b=2 -h=3 -d=$hdim -s=$seqlen $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=$prec -b=3 -h=4 -h_k=1 -d=$hdim -s=$seqlen $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=1 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -156,13 +197,15 @@ run_gfx950_hd192_128_bwd_v3() {
     for prec in "bf16" "fp16" ; do
     for v3_atomic_fp32 in 0 1 ; do
     for mask in 0 1 2 ; do
-    for perm in 0 1 ; do
+    for layout in 0 1 2 ; do
     for batch in 1 2 3 ; do
     for head in 1 2 4 ; do
     for sq in 62 174 299 577 ; do
     for sk in 65 174 299 577 ; do
 
-    $EXE -prec=$prec -b=$batch -h=$head -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
+    LAYOUT_ARGS="$(layout_args_for_case "$layout")" || return 1
+
+    $EXE -prec=$prec -b=$batch -h=$head -d=$hdim -d_v=$hdim_v -s=$sq -s_k=$sk $LAYOUT_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
 
     done
     done
@@ -174,9 +217,10 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
-run_batch_mode_tests
-run_group_mode_tests
-run_swa_tests
+run_targeted_sbhd_a16_regression
+# run_batch_mode_tests
+# run_group_mode_tests
+# run_swa_tests
 # run_gfx950_group_bwd_v3
 # run_gfx950_bwd_v3
 
