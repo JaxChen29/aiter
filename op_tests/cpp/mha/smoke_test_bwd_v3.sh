@@ -217,7 +217,35 @@ run_gfx950_hd192_128_bwd_v3() {
     done
 }
 
-run_targeted_sbhd_a16_regression
+run_targeted_sbhd_gfx950_regression() {
+    echo "===== Targeted SBHD gfx950 regression (D128 Genl + D192_D128 Gen) ====="
+
+    SBHD_ARGS="$(layout_args_for_case 2)" || return 1
+    BHSD_ARGS="$(layout_args_for_case 1)" || return 1
+
+    # D128 psskddv (Genl) coverage: a16 + a32, mask in {0,1,2}, bf16 + fp16
+    for prec in bf16 fp16 ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for mask in 0 1 2 ; do
+        $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=128 -s=512 $SBHD_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=128 -s=512 $BHSD_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    done
+    done
+    done
+
+    # D192_D128 pssk (Gen) coverage: a16 + a32, mask in {0,1,2}, bf16 + fp16
+    for prec in bf16 fp16 ; do
+    for v3_atomic_fp32 in 0 1 ; do
+    for mask in 0 1 2 ; do
+        $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=192 -d_v=128 -s=512 $SBHD_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+        $EXE -prec=$prec -b=2 -h=4 -h_k=2 -d=192 -d_v=128 -s=512 $BHSD_ARGS -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=2 -mode=0 -kname=$KNAME $COMMON_ARGS
+    done
+    done
+    done
+}
+
+run_targeted_sbhd_gfx950_regression
+# run_targeted_sbhd_a16_regression
 # run_batch_mode_tests
 # run_group_mode_tests
 # run_swa_tests

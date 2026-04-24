@@ -52,7 +52,6 @@ def compile_mha_fwd(ck_exclude: bool): ...
 
 
 def cmdGenFunc_mha_bwd(ck_exclude: bool):
-    srcs = [f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_entry.cu"]
     if ck_exclude:
         blob_gen_cmd = []
     else:
@@ -62,7 +61,6 @@ def cmdGenFunc_mha_bwd(ck_exclude: bool):
     blob_gen_cmd.extend(BWD_CODEGEN_CMD)
     flags_extra_cc = ["-DONLY_FAV3", "-DENABLE_CK=0"] if ck_exclude else []
     return {
-        "srcs": srcs,
         "md_name": "libmha_bwd",
         "blob_gen_cmd": blob_gen_cmd,
         "flags_extra_cc": flags_extra_cc,
